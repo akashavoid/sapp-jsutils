@@ -176,11 +176,15 @@ function consume_js_object(id) {
     return object;
 }
 
-/// Get the real object from JsObject returned from rust 
+/// Get the real object from JsObject returned from rust
 /// Acts like borrowing in rust, but without any checks
 /// Be carefull, for most use cases "consume_js_object" is usually better option
 function get_js_object(id) {
     return js_objects[id];
 }
 
+// Expose js_object functions globally so plugins (like getrandom-plugin) can access them
+window.js_object = js_object;
+window.consume_js_object = consume_js_object;
+window.get_js_object = get_js_object;
 
