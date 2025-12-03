@@ -2,12 +2,16 @@
 
 var ctx = null;
 
-var js_objects = {};
-js_objects[-1] = null;
-js_objects[-2] = undefined;
-var unique_js_id = 0;
+function register_plugin(context, importObject) {
+    // Don't destructure wasm_memory - it's set after instantiation
+    // Access context properties dynamically in FFI functions
+    const { UTF8ToString } = context;
 
-function register_plugin(importObject) {
+    // js_object utilities - moved inside to use context
+    var js_objects = {};
+    js_objects[-1] = null;
+    js_objects[-2] = undefined;
+    var unique_js_id = 0;
     importObject.env.js_create_string = function (buf, max_len) {
         var string = UTF8ToString(buf, max_len);
         return js_object(string);
@@ -15,7 +19,10 @@ function register_plugin(importObject) {
 
     // Copy given bytes into newly allocated Uint8Array
     importObject.env.js_create_buffer = function (buf, max_len) {
-        var src = new Uint8Array(wasm_memory.buffer, buf, max_len);
+        if (!context.wasm_memory) {
+            throw new Error("js_create_buffer called before WASM memory initialized");
+        }
+        var src = new Uint8Array(context.wasm_memory.buffer, buf, max_len);
         var new_buffer = new Uint8Array(new ArrayBuffer(src.byteLength));
         new_buffer.set(new Uint8Array(src));
         return js_object(new_buffer);
@@ -46,19 +53,25 @@ function register_plugin(importObject) {
     }
 
     importObject.env.js_unwrap_to_str = function (obj_id, buf, max_len) {
+        if (!context.wasm_memory) {
+            throw new Error("js_unwrap_to_str called before WASM memory initialized");
+        }
         var str = js_objects[obj_id];
         var utf8array = toUTF8Array(str);
         var length = utf8array.length;
-        var dest = new Uint8Array(wasm_memory.buffer, buf, max_len); // with max_len in case of buffer overflow we will panic (I BELIEVE) in js, no UB in rust
+        var dest = new Uint8Array(context.wasm_memory.buffer, buf, max_len);
         for (var i = 0; i < length; i++) {
             dest[i] = utf8array[i];
         }
     }
 
     importObject.env.js_unwrap_to_buf = function (obj_id, buf, max_len) {
+        if (!context.wasm_memory) {
+            throw new Error("js_unwrap_to_buf called before WASM memory initialized");
+        }
         var src = js_objects[obj_id];
         var length = src.length;
-        var dest = new Uint8Array(wasm_memory.buffer, buf, max_len); 
+        var dest = new Uint8Array(context.wasm_memory.buffer, buf, max_len);
         for (var i = 0; i < length; i++) {
             dest[i] = src[i];
         }
@@ -114,10 +127,48 @@ function register_plugin(importObject) {
 
         return js_objects[js_object][field_name];
     }
+
+    // Move js_object utilities inside register_plugin (was lines 154-184)
+    // Store js object reference to prevent JS garbage collector on destroying it
+    // And let Rust keep ownership of this reference
+    function js_object(obj) {
+        if (obj == undefined) {
+            return -2;
+        }
+        if (obj === null) {
+            return -1;
+        }
+        var id = unique_js_id;
+
+        js_objects[id] = obj;
+        unique_js_id += 1;
+        return id;
+    }
+
+    /// Consume the JsObject returned from rust
+    /// Rust gives us ownership on the object. This method consume ownership from rust to normal JS garbage collector.
+    function consume_js_object(id) {
+        var object = js_objects[id];
+        // in JS delete operator does not delete (JS!), the intention here is to remove the value from hashmap, like "js_objects.remove(id)"
+        delete js_objects[id];
+        return object;
+    }
+
+    /// Get the real object from JsObject returned from rust
+    /// Acts like borrowing in rust, but without any checks
+    /// Be carefull, for most use cases "consume_js_object" is usually better option
+    function get_js_object(id) {
+        return js_objects[id];
+    }
+
+    // Add to context for other plugins to use
+    context.js_object = js_object;
+    context.consume_js_object = consume_js_object;
+    context.get_js_object = get_js_object;
 }
 miniquad_add_plugin({ register_plugin, version: 1, name: "sapp_jsutils" });
 
-// Its like https://developer.mozilla.org/en-US/docs/Web/API/TextEncoder, 
+// Its like https://developer.mozilla.org/en-US/docs/Web/API/TextEncoder,
 // but works on more browsers
 function toUTF8Array(str) {
     var utf8 = [];
@@ -149,42 +200,3 @@ function toUTF8Array(str) {
     }
     return utf8;
 }
-
-// Store js object reference to prevent JS garbage collector on destroying it
-// And let Rust keep ownership of this reference
-// There is no guarantees on JS side of this reference uniqueness, its good idea to use this only on rust functions arguments
-function js_object(obj) {
-    if (obj == undefined) {
-        return -2;
-    }
-    if (obj === null) {
-        return -1;
-    }
-    var id = unique_js_id;
-
-    js_objects[id] = obj;
-    unique_js_id += 1;
-    return id;
-}
-
-/// Consume the JsObject returned from rust
-/// Rust gives us ownership on the object. This method consume ownership from rust to normal JS garbage collector.
-function consume_js_object(id) {
-    var object = js_objects[id];
-    // in JS delete operator does not delete (JS!), the intention here is to remove the value from hashmap, like "js_objects.remove(id)"
-    delete js_objects[id];
-    return object;
-}
-
-/// Get the real object from JsObject returned from rust
-/// Acts like borrowing in rust, but without any checks
-/// Be carefull, for most use cases "consume_js_object" is usually better option
-function get_js_object(id) {
-    return js_objects[id];
-}
-
-// Expose js_object functions globally so plugins (like getrandom-plugin) can access them
-window.js_object = js_object;
-window.consume_js_object = consume_js_object;
-window.get_js_object = get_js_object;
-
